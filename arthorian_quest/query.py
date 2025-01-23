@@ -147,7 +147,8 @@ class QueryArthor:
                        search_type: str = 'Substructure',
                        length: int = 10_000,
                        sleep_time: float = 5.0,
-                       continue_on_error: bool = True) -> pd.DataFrame:
+                       continue_on_error: bool = True,
+                       batch_size: int = 10) -> str:
         """
         Perform batch retrieval of multiple queries with progress tracking and error handling.
 
@@ -165,11 +166,13 @@ class QueryArthor:
             Time to wait between queries in seconds, by default 1.0
         continue_on_error : bool, optional
             Whether to continue processing on error, by default True
+        batch_size : int, optional
+            Number of queries to save in intermittant dataframes, by default 10
 
         Returns
         -------
-        pd.DataFrame
-            Combined results from all successful queries
+        str
+            Path to the cache directory where batched dataframes are saved
 
         Examples
         --------
@@ -177,26 +180,23 @@ class QueryArthor:
         >>> qa = QueryArthor(cache_dir='query_cache')
         >>> results: pd.DataFrame = qa.batch_retrieve(queries, ['BB-50-22Q1'])
         """
+        logging.basicConfig(filename=os.path.join(self.cache_dir if self.cache_dir else Path.cwd(),
+                                                  f"arthorian_quest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+                            level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s')
+
         if not self.cache_dir:
-            logging.warning("No cache directory set. Progress tracking will not be available.")
-            # Setup logging
-            logging.basicConfig(
-                filename=f'arthorian_quest_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
-                level=logging.INFO,
-                format='%(asctime)s - %(levelname)s - %(message)s'
-            )
-        else:
-            logging.basicConfig(filename=os.path.join(self.cache_dir, f"arthorian_quest_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log"),
-                                level=logging.INFO,
-                                format='%(asctime)s - %(levelname)s - %(message)s')
+            logging.warning("No cache directory set. Will use current directory for logging and saving.")
+            self.cache_dir = Path.cwd()
+        logging.info(f"Cache directory: {self.cache_dir}")
 
         # Initialize or load progress tracking
         progress_file: str | None = os.path.join(self.cache_dir, "batch_progress.json") if self.cache_dir else None
         logging.info(f"Progress file: {progress_file}")
-        completed = {}
+        completed_batches = {}
         if progress_file and os.path.exists(progress_file):
             with open(progress_file, 'r') as f:
-                completed = json.load(f)
+                completed_batches = json.load(f)
 
         # Check queries is a list
         if not all(isinstance(q, str) for q in queries):
@@ -210,54 +210,54 @@ class QueryArthor:
             logging.error(f"dbnames provided: {dbnames}")
             raise TypeError
 
-        results = []
-        for query in tqdm(queries, desc="Processing queries"):
-            query_inchi = Chem.MolToInchiKey(Chem.MolFromSmiles(query))
-            if query_inchi in completed and completed[query_inchi]:
-                logging.info(f"Skipping already completed query: {query}")
-                continue
+        # Create batches of queries
+        query_batches = [queries[i:i + batch_size] for i in range(0, len(queries), batch_size)]
 
+        for batch_idx, query_batch in enumerate(tqdm(query_batches, desc="Processing batches")):
+            batch_id = f"batch_{batch_idx}"
+            batch_file = os.path.join(self.cache_dir, f"batch_{batch_idx}.pkl.gz")
+            query_inchis = [Chem.MolToInchiKey(Chem.MolFromSmiles(q)) for q in query_batch]
+            assert len(query_inchis) == len(query_batch), "Failed to convert queries to InChI keys"
+
+            # Skip if batch is already completed
+            if batch_id in completed_batches and completed_batches[batch_id]:
+                batch_df = pd.read_pickle(batch_file)
+                if all(inchi in batch_df.query_inchi.values for inchi in query_inchis):
+                    logging.info(f"Skipping completed batch {batch_idx}")
+                    continue
+                logging.info(f"Batch {batch_idx} has missing queries, reprocessing")
+
+            batch_results = []
             try:
-                for dbname in dbnames: # Loop through each database to max number of outputs per database query
-                    df: pd.DataFrame = self.retrieve(query, [dbname], search_type, length) # put dbname in list
+                for query in query_batch:
+                    for dbname in dbnames:
+                        df = self.retrieve(query, [dbname], search_type, length)
+                        if df is not None and not df.empty:
+                            batch_results.append(df)
+                            logging.info(f"Successfully processed query: {query} {dbname} ({len(df)} results)")
+                    sleep(sleep_time)
 
-                    if df is not None and not df.empty:
-                        results.append(df)
-                        if self.cache_dir:
-                            cache_file = os.path.join(self.cache_dir, "query_results.pkl.gz")
-                            logging.info(f"Dumped results {len(df)} at {cache_file}")
-                            with open(cache_file, 'wb') as f:
-                                pickle.dump(results, f)
+                if len(batch_results) == len(query_batch) * len(dbnames):
+                    batch_df = pd.concat(batch_results, ignore_index=True)
+                    batch_df.to_pickle(batch_file)
 
-                    logging.info(f"Successfully processed query: {query} {dbname}")
+                    # Update progress only after successful batch save
+                    completed_batches[batch_id] = True
+                    with open(progress_file, 'w') as f:
+                        json.dump(completed_batches, f)
+                    logging.info(f"Completed and saved batch {batch_idx}")
 
             except Exception as e:
-                error_msg = f"Error processing query {query}: {str(e)}"
+                error_msg = f"Error processing batch {batch_idx}: {str(e)}"
                 logging.error(error_msg)
                 if progress_file:
-                    completed[query_inchi] = False
+                    completed_batches[batch_id] = False
                     with open(progress_file, 'w') as f:
                         json.dump(completed, f)
                 if not continue_on_error:
                     raise Exception(error_msg)
 
-            if progress_file:
-                completed[query_inchi] = True
-                with open(progress_file, 'w') as f:
-                    json.dump(completed, f)
-
-            sleep(sleep_time)
-
-        # Combine results
-        if results:
-            final_df: pd.DataFrame = pd.concat(results, ignore_index=True)
-            if self.cache_dir:
-                cache_file = os.path.join(self.cache_dir, "query_results.pkl.gz")
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(results, f)
-                logging.info(f"Dumped final results at {cache_file}")
-            return final_df
-        return pd.DataFrame()
+        return self.cache_dir
 
     def get_batch_statistics(self) -> Dict:
         """

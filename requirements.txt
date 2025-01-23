@@ -2,3 +2,4 @@ requests
 pandas
 rdkit
 fragmenstein
+tqdm
