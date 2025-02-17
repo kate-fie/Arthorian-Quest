@@ -1,6 +1,8 @@
 __all__ = ['QueryArthor']
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import warnings
 import pandas as pd
 from typing import List, Optional, Dict, Union
@@ -33,15 +35,29 @@ class QueryArthor:
     enamine_dbs = ['BB-ForSale-22Q1', 'MADE-BB-23Q1-770M', 'REAL-Database-22Q1']
 
     def __init__(self, base_url: str = 'https://arthor.docking.org/',
-                 cache_dir: Optional[Union[str, Path]] = None):
+                 cache_dir: Optional[Union[str, Path]] = None,
+                 max_retries: int = 3,
+                 backoff_factor: float = 1.0):
         self.base_url = base_url
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(exist_ok=True)
 
+        # Configure session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=backoff_factor,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
     @property
     def dbs(self):
-        return pd.DataFrame(requests.get(self.base_url + 'dt/data').json())
+        return pd.DataFrame(self.session.get(self.base_url + 'dt/data').json())
 
     def create_empty_metadata_row(self, query: str, query_inchi: str, data: dict, length: int,
                                   dbname: str) -> pd.DataFrame:
@@ -79,67 +95,115 @@ class QueryArthor:
         :param dbnames: list of names (see self.dbs)
         :return:
         """
-        dbname: str = ','.join(dbnames)
-        query_inchi: Optional[str] = None
-        if isinstance(query, Chem.Mol):
-            query = Chem.MolToSmarts(query)
-            query_inchi = Chem.MolToInchiKey(query)
-        if isinstance(query, str) and query_inchi is None:
-            query_inchi = Chem.MolToInchiKey(Chem.MolFromSmiles(query))
+        try:
+            dbname: str = ','.join(dbnames)
+            query_inchi: Optional[str] = None
 
-        response: requests.Response = requests.get(self.base_url + f'/dt/{dbname}/search',
-                                                   dict(query=query,
-                                                        type=search_type,
-                                                        length=length)
-                                                   )
+            # Validate and process query
+            if isinstance(query, Chem.Mol):
+                query = Chem.MolToSmarts(query)
+                query_inchi = Chem.MolToInchiKey(query)
+            if isinstance(query, str) and query_inchi is None:
+                mol = Chem.MolFromSmiles(query)
+                if mol is None:
+                    raise ValueError(f"Invalid SMILES query: {query}")
+                query_inchi = Chem.MolToInchiKey(mol)
 
-        if response.status_code == 503:
-            raise ConnectionError('Arthor unavailable. cf. https://arthor.docking.org/')
+            # Use session with retry logic and timeout
+            response = self.session.get(
+                self.base_url + f'/dt/{dbname}/search',
+                params={
+                    'query': query,
+                    'type': search_type,
+                    'length': length
+                },
+                timeout=30
+            )
 
-        response.raise_for_status()
-        data: dict = response.json()
+            if response.status_code == 503:
+                raise ConnectionError('Arthor unavailable. cf. https://arthor.docking.org/')
 
-        if data.get("message", '') == "SMARTS query is always false!":
-            warnings.warn(f"SMARTS query {query} is always false")
-            return self.create_empty_metadata_row(query=query,
-                                                  query_inchi=query_inchi,
-                                                  data=data,
-                                                  length=length,
-                                                  dbname=dbname)
-        if data.get('warning', ''):
-            warnings.warn(data['warning'])
-        if not data.get('recordsTotal', False):
-            warnings.warn(f"SMARTS query {query} returned no matches")
-            return self.create_empty_metadata_row(query=query,
-                                                  query_inchi=query_inchi,
-                                                  data=data,
-                                                  length=length,
-                                                  dbname=dbname)
+            response.raise_for_status()
+            data: dict = response.json()
 
-        matches = pd.DataFrame(data['data'],
-                               columns=['arthor.rank', 'arthor.index', 'smiles', 'identifier', 'arthor.source'])
+            # Handle empty or invalid responses
+            if data.get("message", '') == "SMARTS query is always false!":
+                warnings.warn(f"SMARTS query {query} is always false")
+                return self.create_empty_metadata_row(query=query,
+                                                      query_inchi=query_inchi,
+                                                      data=data,
+                                                      length=length,
+                                                      dbname=dbname)
+            if data.get('warning', ''):
+                warnings.warn(data['warning'])
+            if not data.get('recordsTotal', False):
+                warnings.warn(f"SMARTS query {query} returned no matches")
+                return self.create_empty_metadata_row(query=query,
+                                                      query_inchi=query_inchi,
+                                                      data=data,
+                                                      length=length,
+                                                      dbname=dbname)
 
-        if len(matches) == 0:  # empty
-            return self.create_empty_metadata_row(query=query,
-                                                  query_inchi=query_inchi,
-                                                  data=data,
-                                                  length=length,
-                                                  dbname=dbname)
+            matches = pd.DataFrame(data['data'],
+                                   columns=['arthor.rank', 'arthor.index', 'smiles', 'identifier', 'arthor.source'])
 
-        matches['arthor.source'] = matches['arthor.source'].apply(lambda x: x.replace('\t', ''))
-        # add metadata from query
-        matches['recordsTotal'] = data['recordsTotal']
-        matches['recordsFiltered'] = data['recordsFiltered']
-        matches['hasMore'] = data['hasMore']
-        matches['query'] = query
-        matches['query_inchi'] = query_inchi
-        matches['query_length'] = length
-        matches = matches.drop_duplicates('arthor.index')
-        PandasTools.AddMoleculeColumnToFrame(matches, 'smiles', 'mol', includeFingerprints=True)
-        matches = matches.loc[~matches.mol.isnull()]
-        matches['N_RB'] = matches.mol.apply(AllChem.CalcNumRotatableBonds)
-        matches['N_HA'] = matches.mol.apply(AllChem.CalcNumHeavyAtoms)
-        return matches.sort_values('N_HA').reset_index(drop=True)
+            if len(matches) == 0:  # empty
+                return self.create_empty_metadata_row(query=query,
+                                                      query_inchi=query_inchi,
+                                                      data=data,
+                                                      length=length,
+                                                      dbname=dbname)
+
+            matches['arthor.source'] = matches['arthor.source'].apply(lambda x: x.replace('\t', ''))
+            # add metadata from query
+            matches['recordsTotal'] = data['recordsTotal']
+            matches['recordsFiltered'] = data['recordsFiltered']
+            matches['hasMore'] = data['hasMore']
+            matches['query'] = query
+            matches['query_inchi'] = query_inchi
+            matches['query_length'] = length
+
+            # Remove duplicates before heavy computations
+            matches = matches.drop_duplicates('arthor.index')
+
+            # Add molecule information with error handling
+            PandasTools.AddMoleculeColumnToFrame(matches, 'smiles', 'mol', includeFingerprints=True)
+            matches = matches.loc[~matches.mol.isnull()]
+
+            # Calculate properties
+            matches['N_RB'] = matches.mol.apply(AllChem.CalcNumRotatableBonds)
+            matches['N_HA'] = matches.mol.apply(AllChem.CalcNumHeavyAtoms)
+
+            return matches.sort_values('N_HA').reset_index(drop=True)
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error during query {query}: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Error processing query {query}: {str(e)}")
+            raise
+
+    def _is_batch_complete(self, batch_id: str, batch_file: str, query_inchis: List[str],
+                           completed_batches: Dict) -> bool:
+        """Helper method to check if a batch is complete"""
+        if batch_id in completed_batches and completed_batches[batch_id]:
+            if os.path.exists(batch_file):
+                try:
+                    batch_df = pd.read_pickle(batch_file)
+                    return all(inchi in batch_df.query_inchi.values for inchi in query_inchis)
+                except Exception as e:
+                    logging.warning(f"Could not read batch file {batch_file}: {str(e)}")
+        return False
+
+    def _update_progress(self, progress_file: str, batch_id: str,
+                         completed_batches: Dict, status: bool) -> None:
+        """Helper method to update progress safely"""
+        try:
+            completed_batches[batch_id] = status
+            with open(progress_file, 'w') as f:
+                json.dump(completed_batches, f)
+        except Exception as e:
+            logging.error(f"Failed to update progress file: {str(e)}")
 
     def batch_retrieve(self,
                        queries: List[str],
@@ -163,48 +227,48 @@ class QueryArthor:
         length : int, optional
             Maximum number of results per database per query, by default 10_000.
         sleep_time : float, optional
-            Time to wait between queries in seconds, by default 1.0
+            Time to wait between queries in seconds, by default 5.0
         continue_on_error : bool, optional
             Whether to continue processing on error, by default True
         batch_size : int, optional
-            Number of queries to save in intermittant dataframes, by default 10
+            Number of queries to save in intermittent dataframes, by default 10
 
         Returns
         -------
         str
             Path to the cache directory where batched dataframes are saved
-
-        Examples
-        --------
-        >>> queries = ['[CH3]-[CH2X4]', '[OH]-[CH2]']
-        >>> qa = QueryArthor(cache_dir='query_cache')
-        >>> results: pd.DataFrame = qa.batch_retrieve(queries, ['BB-50-22Q1'])
         """
-        logging.basicConfig(filename=os.path.join(self.cache_dir if self.cache_dir else Path.cwd(),
-                                                  f"arthorian_quest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-                            level=logging.INFO,
-                            format='%(asctime)s - %(levelname)s - %(message)s')
+        # Setup logging
+        log_file = os.path.join(
+            self.cache_dir if self.cache_dir else Path.cwd(),
+            f"arthorian_quest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
 
         if not self.cache_dir:
-            logging.warning("No cache directory set. Will use current directory for logging and saving.")
             self.cache_dir = Path.cwd()
-        logging.info(f"Cache directory: {self.cache_dir}")
+            logging.warning(f"No cache directory set. Using current directory: {self.cache_dir}")
 
-        # Initialize or load progress tracking
-        progress_file: str | None = os.path.join(self.cache_dir, "batch_progress.json") if self.cache_dir else None
-        logging.info(f"Progress file: {progress_file}")
+        # Initialize progress tracking
+        progress_file = os.path.join(self.cache_dir, "batch_progress.json")
         completed_batches = {}
-        if progress_file and os.path.exists(progress_file):
-            with open(progress_file, 'r') as f:
-                completed_batches = json.load(f)
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r') as f:
+                    completed_batches = json.load(f)
+            except json.JSONDecodeError:
+                logging.warning("Corrupted progress file. Starting fresh.")
 
-        # Check queries is a list
+        # Input validation
         if not all(isinstance(q, str) for q in queries):
             logging.error("Queries must be a list of strings!")
             logging.error(f"Queries provided: {queries}")
             raise TypeError
 
-        # Check dbnames is a list
         if not all(isinstance(db, str) for db in dbnames):
             logging.error("dbnames must be a list of strings!")
             logging.error(f"dbnames provided: {dbnames}")
@@ -216,44 +280,46 @@ class QueryArthor:
         for batch_idx, query_batch in enumerate(tqdm(query_batches, desc="Processing batches")):
             batch_id = f"batch_{batch_idx}"
             batch_file = os.path.join(self.cache_dir, f"batch_{batch_idx}.pkl.gz")
-            query_inchis = [Chem.MolToInchiKey(Chem.MolFromSmiles(q)) for q in query_batch]
-            assert len(query_inchis) == len(query_batch), "Failed to convert queries to InChI keys"
 
-            # Skip if batch is already completed
-            if batch_id in completed_batches and completed_batches[batch_id]:
-                batch_df = pd.read_pickle(batch_file)
-                if all(inchi in batch_df.query_inchi.values for inchi in query_inchis):
+            try:
+                # Convert queries to InChI keys with error handling
+                query_inchis = []
+                for q in query_batch:
+                    mol = Chem.MolFromSmiles(q)
+                    if mol is None:
+                        raise ValueError(f"Invalid SMILES in batch {batch_idx}: {q}")
+                    query_inchis.append(Chem.MolToInchiKey(mol))
+
+                # Skip if batch is already completed
+                if self._is_batch_complete(batch_id, batch_file, query_inchis, completed_batches):
                     logging.info(f"Skipping completed batch {batch_idx}")
                     continue
-                logging.info(f"Batch {batch_idx} has missing queries, reprocessing")
 
-            batch_results = []
-            try:
+                batch_results = []
                 for query in query_batch:
                     for dbname in dbnames:
-                        df = self.retrieve(query, [dbname], search_type, length)
-                        if df is not None and not df.empty:
-                            batch_results.append(df)
-                            logging.info(f"Successfully processed query: {query} {dbname} ({len(df)} results)")
+                        try:
+                            df = self.retrieve(query, [dbname], search_type, length)
+                            if df is not None and not df.empty:
+                                batch_results.append(df)
+                                logging.info(f"Successfully processed query: {query} {dbname} ({len(df)} results)")
+                        except Exception as e:
+                            error_msg = f"Error processing query {query} {dbname}: {str(e)}"
+                            logging.error(error_msg)
+                            if not continue_on_error:
+                                raise
                     sleep(sleep_time)
 
-                if len(batch_results) == len(query_batch) * len(dbnames):
+                if batch_results:
                     batch_df = pd.concat(batch_results, ignore_index=True)
                     batch_df.to_pickle(batch_file)
-
-                    # Update progress only after successful batch save
-                    completed_batches[batch_id] = True
-                    with open(progress_file, 'w') as f:
-                        json.dump(completed_batches, f)
+                    self._update_progress(progress_file, batch_id, completed_batches, True)
                     logging.info(f"Completed and saved batch {batch_idx}")
 
             except Exception as e:
                 error_msg = f"Error processing batch {batch_idx}: {str(e)}"
                 logging.error(error_msg)
-                if progress_file:
-                    completed_batches[batch_id] = False
-                    with open(progress_file, 'w') as f:
-                        json.dump(completed, f)
+                self._update_progress(progress_file, batch_id, completed_batches, False)
                 if not continue_on_error:
                     raise Exception(error_msg)
 
